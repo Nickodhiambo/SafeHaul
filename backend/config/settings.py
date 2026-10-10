@@ -47,6 +47,11 @@ INSTALLED_APPS = [
     # Third party
     'rest_framework',
     'corsheaders',
+
+    # Custom
+    'api',
+    'services',
+    'tests',
 ]
 
 MIDDLEWARE = [
