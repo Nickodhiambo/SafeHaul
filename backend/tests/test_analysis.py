@@ -42,8 +42,9 @@ class FakeWeather:
         self.rain, self.snow = rain, snow
         self.calls = []
 
-    def get_weather(self, requests):
+    def get_weather(self, requests, *, prefetch_points=(), prefetch_until=None):
         self.calls.append(list(requests))
+        self.prefetch = (list(prefetch_points), prefetch_until)
         return [
             WeatherSample(when, self.wind_fn(lat, lon), self.wind_fn(lat, lon) + 8, self.rain, self.snow)
             for lat, lon, when in requests
@@ -196,3 +197,10 @@ def test_corridor_covers_all_routes_without_duplicates():
     lats = [p["lat"] for p in pts]
     assert max(lats) > 0.3 and min(lats) < -0.3  # includes the northern and southern routes
     assert pts[0] == {"lat": 0.0, "lon": 0.0}  # starts at the origin
+
+
+def test_weather_prefetch_covers_corridor_and_next_48_hours():
+    out, _, weather = run()
+    points, until = weather.prefetch
+    assert until == DEP + timedelta(hours=48)
+    assert [{"lat": lat, "lon": lon} for lat, lon in points] == out["corridor"]

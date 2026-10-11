@@ -296,3 +296,25 @@ def test_analyze_response_corridor_feeds_the_heatmap_request(api, services, monk
     monkeypatch.setattr(deps, "get_services", lambda: heat)  # swap in the heatmap's weather client
     r = post_heat(api, heat_body(points=corridor[:5]))
     assert r.status_code == 200 and len(r.json()["points"]) == 5
+
+
+def test_heatmap_after_analyze_makes_no_weather_provider_calls(api, monkeypatch):
+    http = LiveClockHttp()
+    s = SimpleNamespace(
+        routing=FakeRouting(three_routes()),
+        weather=WeatherClient(http_get=http, sleep=lambda s: None),
+        geocoding=FakeGeocoder(),
+    )
+    monkeypatch.setattr(deps, "get_services", lambda: s)
+
+    analysis = post(api, body()).json()
+    calls_after_analyze = len(http.calls)
+    assert calls_after_analyze >= 1
+
+    r = post_heat(api, {
+        "points": analysis["corridor"],
+        "start": analysis["request"]["departure"],
+        "load_lb": 30000,
+    })
+    assert r.status_code == 200 and r.json()["hours"] == 48
+    assert len(http.calls) == calls_after_analyze  # served entirely from the warmed cache

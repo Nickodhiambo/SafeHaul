@@ -21,6 +21,7 @@ sample.
 """
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -34,8 +35,12 @@ HOURLY_VARS = "wind_speed_10m,wind_gusts_10m,rain,showers,snowfall"
 GRID_DECIMALS = 1
 MAX_FORECAST_DAYS = 16
 BATCH_SIZE = 50
-CACHE_TTL_S = 30 * 60
+CACHE_TTL_S = 60 * 60  # fresh for an hour (forecast models update hourly at best)
+STALE_TTL_S = 6 * 60 * 60  # ...and usable for 6 more hours if the provider is failing
+MAX_CACHE_ENTRIES = 2000
 HOUR_S = 3600
+
+logger = logging.getLogger(__name__)
 
 GridKey = tuple[float, float]
 
@@ -156,11 +161,17 @@ def default_http_get(url: str, params: dict, timeout: float = 15):
 
 
 class TTLCache:
-    """Minimal thread-safe in-memory cache. Swap for Django's cache/Redis if you scale out."""
+    """Minimal thread-safe in-memory cache with a fresh window and a longer stale window.
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic):
+    `get` only returns fresh entries. `get_stale` also returns entries past their fresh time
+    (but within the stale window), used as a fallback when the provider is failing.
+    Swap for Django's cache/Redis if you scale out.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, max_entries: int = MAX_CACHE_ENTRIES):
         self._clock = clock
-        self._data: dict = {}
+        self._max = max_entries
+        self._data: dict = {}  # key -> (fresh_until, stale_until, value)
         self._lock = threading.Lock()
 
     def get(self, key):
@@ -168,15 +179,29 @@ class TTLCache:
             item = self._data.get(key)
             if item is None:
                 return None
-            expires, value = item
-            if self._clock() >= expires:
+            fresh_until, stale_until, value = item
+            now = self._clock()
+            if now >= stale_until:
                 del self._data[key]
                 return None
-            return value
+            return value if now < fresh_until else None
 
-    def set(self, key, value, ttl_s: float):
+    def get_stale(self, key):
         with self._lock:
-            self._data[key] = (self._clock() + ttl_s, value)
+            item = self._data.get(key)
+            if item is None or self._clock() >= item[1]:
+                return None
+            return item[2]
+
+    def set(self, key, value, ttl_s: float, stale_ttl_s: float = 0.0):
+        with self._lock:
+            now = self._clock()
+            self._data[key] = (now + ttl_s, now + ttl_s + stale_ttl_s, value)
+            if len(self._data) > self._max:
+                for k in [k for k, (_, stale, _) in self._data.items() if now >= stale]:
+                    del self._data[k]
+                while len(self._data) > self._max:  # still too big: drop the soonest to expire
+                    del self._data[min(self._data, key=lambda k: self._data[k][1])]
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +218,7 @@ class WeatherClient:
         wind_metric: str = "sustained",
         batch_size: int = BATCH_SIZE,
         ttl_s: float = CACHE_TTL_S,
+        stale_ttl_s: float = STALE_TTL_S,
         retries: int = 2,
     ):
         if wind_metric not in ("sustained", "gust"):
@@ -204,11 +230,23 @@ class WeatherClient:
         self.wind_metric = wind_metric
         self._batch_size = batch_size
         self._ttl_s = ttl_s
+        self._stale_ttl_s = stale_ttl_s
         self._retries = retries
 
     # -- public ------------------------------------------------------------
-    def get_weather(self, requests: Sequence[tuple[float, float, datetime]]) -> list[WeatherSample]:
-        """Weather for each (lat, lon, when) in order. `when` must be timezone-aware."""
+    def get_weather(
+        self,
+        requests: Sequence[tuple[float, float, datetime]],
+        *,
+        prefetch_points: Sequence[tuple[float, float]] = (),
+        prefetch_until: datetime | None = None,
+    ) -> list[WeatherSample]:
+        """Weather for each (lat, lon, when) in order. `when` must be timezone-aware.
+
+        `prefetch_points` / `prefetch_until` warm the cache for data we know the heatmap will
+        need next (the corridor points for the next 48 hours), in the same batched fetch, so
+        the follow-up heatmap request makes no provider calls at all.
+        """
         if not requests:
             return []
         if any(w.tzinfo is None for _, _, w in requests):
@@ -217,6 +255,9 @@ class WeatherClient:
         keys = {grid_key(lat, lon) for lat, lon, _ in requests}
         need_start = min(w for _, _, w in requests)
         need_end = max(w for _, _, w in requests)
+        if prefetch_points and prefetch_until is not None:
+            keys |= {grid_key(lat, lon) for lat, lon in prefetch_points}
+            need_end = max(need_end, min(prefetch_until, self.latest_forecast_time()))
         series = self.load_series(keys, need_start, need_end)
         return [sample_at(series[grid_key(lat, lon)], w, self.wind_metric) for lat, lon, w in requests]
 
@@ -234,13 +275,25 @@ class WeatherClient:
 
         chunks = [missing[i : i + self._batch_size] for i in range(0, len(missing), self._batch_size)]
         if chunks:
-            with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
-                results = list(pool.map(lambda c: self._fetch(c, days), chunks))
+            try:
+                with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
+                    results = list(pool.map(lambda c: self._fetch(c, days), chunks))
+            except WeatherUnavailable:
+                return self._serve_stale(found, missing, need_start, need_end)
             for chunk, entries in zip(chunks, results):
                 for key, entry in zip(chunk, entries):
                     s = parse_series(entry)
-                    self._cache.set(key, s, self._ttl_s)
+                    self._cache.set(key, s, self._ttl_s, self._stale_ttl_s)
                     found[key] = s
+        return found
+
+    def _serve_stale(self, found, missing, need_start, need_end):
+        """Provider failing (e.g. rate limited): fall back to older cached forecasts if we have them."""
+        stale = {k: self._cache.get_stale(k) for k in missing}
+        if any(s is None or not (s.covers(need_start.timestamp()) and s.covers(need_end.timestamp())) for s in stale.values()):
+            raise WeatherUnavailable("Weather provider unavailable and no recent forecast cached")
+        logger.warning("Weather provider failing; serving %d cached forecast(s)", len(stale))
+        found.update(stale)
         return found
 
     def latest_forecast_time(self) -> datetime:

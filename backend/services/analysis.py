@@ -11,7 +11,7 @@ client can batch and deduplicate (routes share their start and end areas).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Protocol, Sequence
 
 from .geometry import simplify_path
@@ -22,7 +22,8 @@ from .sampling import LatLon, generate_checkpoints, haversine_mi
 from .weather import WeatherSample, grid_key
 
 MIN_TRIP_MILES = 0.1
-CORRIDOR_POINTS_PER_ROUTE = 70
+CORRIDOR_POINTS_PER_ROUTE = 40
+HEATMAP_HOURS = 48
 MIN_CORRIDOR_SPACING_MI = 5.0
 
 
@@ -52,7 +53,11 @@ class WeatherService(Protocol):
     wind_metric: str
 
     def get_weather(
-        self, requests: Sequence[tuple[float, float, datetime]]
+        self,
+        requests: Sequence[tuple[float, float, datetime]],
+        *,
+        prefetch_points: Sequence[tuple[float, float]] = (),
+        prefetch_until: datetime | None = None,
     ) -> list[WeatherSample]: ...
 
 
@@ -73,10 +78,11 @@ def corridor_points(routes: Sequence[Route], departure: datetime) -> list[dict]:
             segment_durations_s=r.segment_durations_s,
             spacing_mi=spacing,
         ):
-            key = grid_key(cp.lat, cp.lon)
+            lat, lon = round(cp.lat, 4), round(cp.lon, 4)  # round first: the heatmap request
+            key = grid_key(lat, lon)  # will send exactly these values back, so cells must match
             if key not in seen:
                 seen.add(key)
-                points.append({"lat": round(cp.lat, 4), "lon": round(cp.lon, 4)})
+                points.append({"lat": lat, "lon": lon})
     return points
 
 
@@ -111,9 +117,16 @@ def analyze_trip(
         for r in routes
     ]
 
-    # 2. One batched weather call for every checkpoint on every route
+    # 2. One batched weather call for every checkpoint on every route. The corridor points and
+    #    the next 48 hours are fetched in the same call, so the heatmap request that follows
+    #    is served from cache (matters on rate-limited weather APIs).
+    corridor = corridor_points(routes, departure)
     samples = iter(
-        weather.get_weather([(cp.lat, cp.lon, cp.eta) for cps in checkpoints_by_route for cp in cps])
+        weather.get_weather(
+            [(cp.lat, cp.lon, cp.eta) for cps in checkpoints_by_route for cp in cps],
+            prefetch_points=[(p["lat"], p["lon"]) for p in corridor],
+            prefetch_until=departure + timedelta(hours=HEATMAP_HOURS),
+        )
     )
 
     # 3. Risk at each checkpoint
@@ -174,7 +187,7 @@ def analyze_trip(
         "recommended_route_id": recommendation.best.stats.route_id,
         "recommendation": {"summary": recommendation.summary},
         "routes": route_payloads,
-        "corridor": corridor_points(routes, departure),
+        "corridor": corridor,
         "meta": {
             "wind_metric": weather.wind_metric,
             "generated_at": datetime.now(timezone.utc).isoformat(),

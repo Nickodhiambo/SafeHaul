@@ -202,3 +202,81 @@ def test_latest_forecast_time_is_end_of_16_day_window():
     # and the last hour of that window really is fetchable
     [s] = client.get_weather([(1, 1, client.latest_forecast_time())])
     assert s.time == client.latest_forecast_time()
+
+
+# --- prefetch (heatmap warm-up) ---------------------------------------------------------
+def test_prefetch_extends_window_and_adds_points_in_one_request():
+    client, http, _ = make()
+    client.get_weather(
+        [(1.0, 1.0, at(10, 12))],
+        prefetch_points=[(2.0, 2.0), (3.0, 3.0)],
+        prefetch_until=at(12, 12),
+    )
+    assert len(http.calls) == 1 and http.calls[0]["forecast_days"] == 3
+    assert sorted(http.calls[0]["latitude"].split(",")) == ["1.0", "2.0", "3.0"]
+    # the follow-up (heatmap-style) lookups now need no provider calls
+    client.get_weather([(2.0, 2.0, at(12, 10)), (3.0, 3.0, at(11, 5))])
+    assert len(http.calls) == 1
+
+
+def test_prefetch_is_clipped_to_the_forecast_horizon():
+    client, http, _ = make()
+    client.get_weather([(1, 1, at(24, 12))], prefetch_points=[(2, 2)], prefetch_until=at(30, 0))
+    assert http.calls[0]["forecast_days"] == 16  # clipped to the last available hour, not rejected
+
+
+# --- stale fallback when the provider is failing ----------------------------------------
+def stale_client(http, clock):
+    return WeatherClient(
+        http_get=http, now=lambda: NOW, sleep=lambda s: None,
+        cache=TTLCache(clock=lambda: clock[0]), ttl_s=100, stale_ttl_s=1000,
+    )
+
+
+def test_serves_stale_forecast_when_provider_fails():
+    t = [0.0]
+    http = FakeHttp()
+    client = stale_client(http, t)
+    first = client.get_weather([(1, 1, at(10, 12))])
+    t[0] = 500  # past fresh (100s) but inside stale window (1100s)
+    http.fail_times = 99
+    again = client.get_weather([(1, 1, at(10, 12))])
+    assert again == first
+
+
+def test_stale_fallback_expires():
+    t = [0.0]
+    http = FakeHttp()
+    client = stale_client(http, t)
+    client.get_weather([(1, 1, at(10, 12))])
+    t[0] = 2000  # past the stale window
+    http.fail_times = 99
+    with pytest.raises(WeatherUnavailable):
+        client.get_weather([(1, 1, at(10, 12))])
+
+
+def test_no_stale_data_means_the_error_propagates():
+    t = [0.0]
+    http = FakeHttp(fail_times=99)
+    with pytest.raises(WeatherUnavailable):
+        stale_client(http, t).get_weather([(1, 1, at(10, 12))])
+
+
+def test_stale_data_must_still_cover_the_needed_time():
+    t = [0.0]
+    http = FakeHttp()
+    client = stale_client(http, t)
+    client.get_weather([(1, 1, at(10, 12))])  # cached: 1 day of data
+    t[0] = 500
+    http.fail_times = 99
+    with pytest.raises(WeatherUnavailable):
+        client.get_weather([(1, 1, at(12, 12))])  # needs day 3 which the stale entry lacks
+
+
+def test_cache_evicts_oldest_when_full():
+    t = [0.0]
+    c = TTLCache(clock=lambda: t[0], max_entries=3)
+    for i in range(5):
+        t[0] = i
+        c.set(i, f"v{i}", ttl_s=100, stale_ttl_s=0)
+    assert [c.get(i) for i in range(5)] == [None, None, "v2", "v3", "v4"]
