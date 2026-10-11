@@ -30,8 +30,13 @@ SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'test-key')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('SET_DEBUG', '1') == '1'
 
-ALLOWED_HOSTS = os.environ.get(
-        'DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+RENDER_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+if RENDER_HOST:
+    ALLOWED_HOSTS.append(RENDER_HOST)
+
+if not DEBUG and SECRET_KEY == "dev-only-insecure-key":
+    raise RuntimeError("Set DJANGO_SECRET_KEY in production")
 
 MAPBOX_TOKEN = os.environ.get('MAPBOX_TOKEN')
 
