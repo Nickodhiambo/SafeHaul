@@ -68,7 +68,7 @@ def run(routing=None, weather=None, load_lb=20_000, departure=DEP):
 def test_response_is_json_serializable_and_complete():
     out, _, _ = run()
     json.dumps(out)
-    assert set(out) == {"request", "recommended_route_id", "recommendation", "routes", "meta"}
+    assert set(out) == {"request", "recommended_route_id", "recommendation", "routes", "corridor", "meta"}
     assert len(out["routes"]) == 3
     r = out["routes"][0]
     assert set(r) == {"id", "summary", "rank", "recommended", "distance_mi", "duration_s",
@@ -181,3 +181,18 @@ def test_route_without_label_gets_default_summary():
     r = make_route("route-2", 0.1, "")
     out, _, _ = run(routing=FakeRouting([r]))
     assert out["routes"][0]["summary"] == "Route 2"
+
+
+# --- corridor points for the heatmap ---------------------------------------------
+def test_corridor_covers_all_routes_without_duplicates():
+    from services.weather import grid_key
+
+    out, _, _ = run()
+    pts = out["corridor"]
+    assert 20 < len(pts) < 400
+    cells = [grid_key(p["lat"], p["lon"]) for p in pts]
+    assert len(cells) == len(set(cells))  # one point per weather cell
+    assert {"lat", "lon"} == set(pts[0])
+    lats = [p["lat"] for p in pts]
+    assert max(lats) > 0.3 and min(lats) < -0.3  # includes the northern and southern routes
+    assert pts[0] == {"lat": 0.0, "lon": 0.0}  # starts at the origin

@@ -197,3 +197,102 @@ def test_missing_token_configuration_is_a_clean_error(api, monkeypatch):
 
 def test_only_post_allowed_on_analyze(api, services):
     assert api.get("/api/analyze/").status_code == 405
+
+
+# --- heatmap ---------------------------------------------------------------------------
+from services.weather import WeatherClient  # noqa: E402
+
+
+class LiveClockHttp:
+    """Open-Meteo stand-in whose series starts at today's 00:00 GMT (matches the real clock)."""
+
+    def __init__(self, error=None):
+        self.error, self.calls = error, []
+
+    def __call__(self, url, params):
+        self.calls.append(params)
+        if self.error:
+            raise self.error
+        midnight = int(timezone.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        n = params["forecast_days"] * 24
+        out = []
+        for la, lo in zip(params["latitude"].split(","), params["longitude"].split(",")):
+            out.append({"hourly": {
+                "time": [midnight + 3600 * i for i in range(n)],
+                "wind_speed_10m": [12.0] * n, "wind_gusts_10m": [20.0] * n,
+                "rain": [0.0] * n, "showers": [0.0] * n, "snowfall": [0.0] * n,
+            }})
+        return out if len(out) > 1 else out[0]
+
+
+@pytest.fixture
+def heat_services(monkeypatch):
+    http = LiveClockHttp()
+    weather = WeatherClient(http_get=http, sleep=lambda s: None)
+    s = SimpleNamespace(routing=None, weather=weather, geocoding=None, http=http)
+    monkeypatch.setattr(deps, "get_services", lambda: s)
+    return s
+
+
+def heat_body(**over):
+    b = {"points": [{"lat": 36.8, "lon": -1.3}, {"lat": 41.9, "lon": -87.6}],
+         "start": departure(), "load_lb": 30000}
+    b.update(over)
+    return b
+
+
+def post_heat(api, payload):
+    return api.post("/api/heatmap/", payload, format="json")
+
+
+def test_heatmap_success(api, heat_services):
+    r = post_heat(api, heat_body())
+    assert r.status_code == 200
+    d = r.json()
+    assert d["hours"] == 48 and len(d["points"]) == 2
+    assert len(d["points"][0]["level"]) == 49 and set(d["points"][0]["level"]) == {1}  # calm weather
+    assert len(heat_services.http.calls) == 1  # both points in one batched request
+
+
+def test_heatmap_hours_option(api, heat_services):
+    d = post_heat(api, heat_body(hours=12)).json()
+    assert d["hours"] == 12 and len(d["points"][0]["level"]) == 13
+
+
+@pytest.mark.parametrize("override,field", [
+    ({"points": []}, "points"),
+    ({"points": [{"lat": 1}]}, "points"),
+    ({"points": [{"lat": 99, "lon": 0}]}, "points"),
+    ({"points": [{"lat": 1.0, "lon": 1.0}] * 401}, "points"),
+    ({"start": "2026-10-12T08:00:00"}, "start"),
+    ({"start": "2020-01-01T08:00:00Z"}, "start"),
+    ({"hours": 0}, "hours"),
+    ({"hours": 49}, "hours"),
+    ({"load_lb": -1}, "load_lb"),
+])
+def test_heatmap_validation(api, heat_services, override, field):
+    r = post_heat(api, heat_body(**override))
+    assert r.status_code == 400 and field in r.json()["error"]["fields"]
+
+
+def test_heatmap_start_beyond_forecast_window(api, heat_services):
+    r = post_heat(api, heat_body(start=departure(hours=24 * 20)))
+    assert r.status_code == 422 and r.json()["error"]["code"] == "forecast_unavailable"
+
+
+def test_heatmap_weather_provider_down(api, monkeypatch):
+    http = LiveClockHttp(error=WeatherUnavailable("down"))
+    s = SimpleNamespace(weather=WeatherClient(http_get=http, sleep=lambda s: None))
+    monkeypatch.setattr(deps, "get_services", lambda: s)
+    r = post_heat(api, heat_body())
+    assert r.status_code == 502 and r.json()["error"]["code"] == "upstream_unavailable"
+
+
+def test_analyze_response_corridor_feeds_the_heatmap_request(api, services, monkeypatch):
+    corridor = post(api, body()).json()["corridor"]
+    assert corridor and {"lat", "lon"} == set(corridor[0])
+
+    heat = SimpleNamespace(weather=WeatherClient(http_get=LiveClockHttp(), sleep=lambda s: None))
+    monkeypatch.setattr(deps, "get_services", lambda: heat)  # swap in the heatmap's weather client
+    r = post_heat(api, heat_body(points=corridor[:5]))
+    assert r.status_code == 200 and len(r.json()["points"]) == 5

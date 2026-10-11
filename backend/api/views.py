@@ -5,18 +5,15 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from services.analysis import InvalidTrip, Location, analyze_trip
+from services.heatmap import build_heatmap
 from services.geocoding import GeocodingError, GeocodingUnavailable, PlaceNotFound
 from services.routing import NoRouteFound, RoutingError, RoutingUnavailable
 from services.weather import ForecastRangeError, WeatherError, WeatherUnavailable
 
 from . import deps
-from .serializers import AnalyzeRequestSerializer
+from .serializers import AnalyzeRequestSerializer, HeatmapRequestSerializer
 
 logger = logging.getLogger(__name__)
-
-@api_view(['GET'])
-def health(request):
-    return Response({'status': 'OK'})
 
 
 def _error(code: str, message: str, http_status: int, **extra) -> Response:
@@ -59,6 +56,33 @@ def geocode(request):
     return Response({"results": [p.to_dict() for p in places]})
 
 
+def _upstream_error(exc: Exception) -> Response | None:
+    """Map expected service failures to clean API errors. Returns None for anything else."""
+    if isinstance(exc, InvalidTrip):
+        return _error("invalid_trip", str(exc), status.HTTP_400_BAD_REQUEST)
+    if isinstance(exc, PlaceNotFound):
+        return _error("place_not_found", str(exc), status.HTTP_404_NOT_FOUND)
+    if isinstance(exc, NoRouteFound):
+        return _error("no_route", str(exc), status.HTTP_404_NOT_FOUND)
+    if isinstance(exc, ForecastRangeError):
+        return _error(
+            "forecast_unavailable",
+            "Weather forecasts cover the next 16 days. Pick a departure time within that window.",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+    if isinstance(exc, (WeatherUnavailable, RoutingUnavailable, GeocodingUnavailable)):
+        logger.warning("Upstream service unavailable", exc_info=exc)
+        return _error(
+            "upstream_unavailable",
+            "A routing or weather service is temporarily unavailable. Please try again.",
+            status.HTTP_502_BAD_GATEWAY,
+        )
+    if isinstance(exc, (RoutingError, GeocodingError, WeatherError)):
+        logger.error("Upstream service error", exc_info=exc)
+        return _error("upstream_error", "The analysis could not be completed.", status.HTTP_502_BAD_GATEWAY)
+    return None
+
+
 @api_view(["POST"])
 def analyze(request):
     """Analyze all route options for a trip and recommend the safest."""
@@ -78,27 +102,36 @@ def analyze(request):
             origin, destination, data["departure"], data["load_lb"],
             routing=services.routing, weather=services.weather,
         )
-    except InvalidTrip as e:
-        return _error("invalid_trip", str(e), status.HTTP_400_BAD_REQUEST)
-    except PlaceNotFound as e:
-        return _error("place_not_found", str(e), status.HTTP_404_NOT_FOUND)
-    except NoRouteFound as e:
-        return _error("no_route", str(e), status.HTTP_404_NOT_FOUND)
-    except ForecastRangeError:
-        return _error(
-            "forecast_unavailable",
-            "Weather forecasts cover the next 16 days. Pick a departure time within that window.",
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-        )
-    except (WeatherUnavailable, RoutingUnavailable, GeocodingUnavailable):
-        logger.warning("Upstream service unavailable", exc_info=True)
-        return _error(
-            "upstream_unavailable",
-            "A routing or weather service is temporarily unavailable. Please try again.",
-            status.HTTP_502_BAD_GATEWAY,
-        )
-    except (RoutingError, GeocodingError, WeatherError):
-        logger.exception("Upstream service error")
-        return _error("upstream_error", "The analysis could not be completed.", status.HTTP_502_BAD_GATEWAY)
+    except Exception as exc:
+        response = _upstream_error(exc)
+        if response is None:
+            raise
+        return response
+    return Response(result)
 
+
+@api_view(["POST"])
+def heatmap(request):
+    """Risk level per corridor point for each hour 0..48 after departure."""
+    serializer = HeatmapRequestSerializer(data=request.data)
+    if not serializer.is_valid():
+        return _error(
+            "invalid_request", "Please check the heatmap request.", status.HTTP_400_BAD_REQUEST,
+            fields=serializer.errors,
+        )
+    data = serializer.validated_data
+
+    try:
+        result = build_heatmap(
+            [(p["lat"], p["lon"]) for p in data["points"]],
+            data["start"],
+            data["load_lb"],
+            weather=deps.get_services().weather,
+            hours=data["hours"],
+        )
+    except Exception as exc:
+        response = _upstream_error(exc)
+        if response is None:
+            raise
+        return response
     return Response(result)

@@ -19,9 +19,11 @@ from .recommend import CheckpointRisk, RouteInput, recommend_route
 from .risk import assess_checkpoint
 from .routing import Route
 from .sampling import LatLon, generate_checkpoints, haversine_mi
-from .weather import WeatherSample
+from .weather import WeatherSample, grid_key
 
 MIN_TRIP_MILES = 0.1
+CORRIDOR_POINTS_PER_ROUTE = 70
+MIN_CORRIDOR_SPACING_MI = 5.0
 
 
 class InvalidTrip(ValueError):
@@ -52,6 +54,30 @@ class WeatherService(Protocol):
     def get_weather(
         self, requests: Sequence[tuple[float, float, datetime]]
     ) -> list[WeatherSample]: ...
+
+
+def corridor_points(routes: Sequence[Route], departure: datetime) -> list[dict]:
+    """Evenly spaced points along every route for the heatmap, one per ~7 mi weather cell.
+
+    Denser than the risk checkpoints (which follow the 10/25/50 mi rule) so the heatmap looks
+    continuous; points sharing a weather grid cell are merged since they'd have identical data.
+    """
+    seen, points = set(), []
+    for r in routes:
+        spacing = max(MIN_CORRIDOR_SPACING_MI, r.distance_mi / CORRIDOR_POINTS_PER_ROUTE)
+        for cp in generate_checkpoints(
+            r.coords,
+            departure,
+            total_distance_mi=r.distance_mi,
+            total_duration_s=r.duration_s,
+            segment_durations_s=r.segment_durations_s,
+            spacing_mi=spacing,
+        ):
+            key = grid_key(cp.lat, cp.lon)
+            if key not in seen:
+                seen.add(key)
+                points.append({"lat": round(cp.lat, 4), "lon": round(cp.lon, 4)})
+    return points
 
 
 def analyze_trip(
@@ -148,6 +174,7 @@ def analyze_trip(
         "recommended_route_id": recommendation.best.stats.route_id,
         "recommendation": {"summary": recommendation.summary},
         "routes": route_payloads,
+        "corridor": corridor_points(routes, departure),
         "meta": {
             "wind_metric": weather.wind_metric,
             "generated_at": datetime.now(timezone.utc).isoformat(),

@@ -5,8 +5,28 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import serializers
 
+from services.heatmap import MAX_HOURS, MAX_POINTS
+
 MAX_LOAD_LB = 150_000  # legal US max is ~80,000 lb; leave headroom for oversize loads
 PAST_GRACE = timedelta(hours=1)
+
+
+def parse_departure(value: str):
+    """ISO 8601 string with a timezone offset -> aware UTC datetime. Rejects past times."""
+    try:
+        dt = parse_datetime(value)
+    except ValueError:
+        dt = None
+    if dt is None:
+        raise serializers.ValidationError("Use an ISO 8601 date and time, e.g. 2026-10-12T08:00:00Z.")
+    if dt.tzinfo is None:
+        raise serializers.ValidationError(
+            "Include a timezone offset, e.g. 2026-10-12T08:00:00Z or 2026-10-12T11:00:00+03:00."
+        )
+    dt = dt.astimezone(dt_timezone.utc)
+    if dt < timezone.now() - PAST_GRACE:
+        raise serializers.ValidationError("Departure time is in the past.")
+    return dt
 
 
 class PlaceInputSerializer(serializers.Serializer):
@@ -33,17 +53,19 @@ class AnalyzeRequestSerializer(serializers.Serializer):
     load_lb = serializers.FloatField(min_value=0, max_value=MAX_LOAD_LB)
 
     def validate_departure(self, value):
-        try:
-            dt = parse_datetime(value)
-        except ValueError:
-            dt = None
-        if dt is None:
-            raise serializers.ValidationError("Use an ISO 8601 date and time, e.g. 2026-10-12T08:00:00Z.")
-        if dt.tzinfo is None:
-            raise serializers.ValidationError(
-                "Include a timezone offset, e.g. 2026-10-12T08:00:00Z or 2026-10-12T11:00:00+03:00."
-            )
-        dt = dt.astimezone(dt_timezone.utc)
-        if dt < timezone.now() - PAST_GRACE:
-            raise serializers.ValidationError("Departure time is in the past.")
-        return dt
+        return parse_departure(value)
+
+
+class PointSerializer(serializers.Serializer):
+    lat = serializers.FloatField(min_value=-90, max_value=90)
+    lon = serializers.FloatField(min_value=-180, max_value=180)
+
+
+class HeatmapRequestSerializer(serializers.Serializer):
+    points = serializers.ListField(child=PointSerializer(), min_length=1, max_length=MAX_POINTS)
+    start = serializers.CharField()  # the departure time
+    load_lb = serializers.FloatField(min_value=0, max_value=MAX_LOAD_LB)
+    hours = serializers.IntegerField(min_value=1, max_value=MAX_HOURS, default=MAX_HOURS)
+
+    def validate_start(self, value):
+        return parse_departure(value)

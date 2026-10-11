@@ -194,3 +194,11 @@ def test_malformed_series_rejected():
     client = WeatherClient(http_get=bad, now=lambda: NOW, sleep=lambda s: None)
     with pytest.raises(WeatherUnavailable):
         client.get_weather([(1, 1, at(10, 12))])
+
+
+def test_latest_forecast_time_is_end_of_16_day_window():
+    client, _, _ = make()
+    assert client.latest_forecast_time() == datetime(2026, 10, 25, 23, 0, tzinfo=UTC)
+    # and the last hour of that window really is fetchable
+    [s] = client.get_weather([(1, 1, client.latest_forecast_time())])
+    assert s.time == client.latest_forecast_time()

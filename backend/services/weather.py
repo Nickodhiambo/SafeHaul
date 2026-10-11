@@ -26,7 +26,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Sequence
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -242,6 +242,11 @@ class WeatherClient:
                     self._cache.set(key, s, self._ttl_s)
                     found[key] = s
         return found
+
+    def latest_forecast_time(self) -> datetime:
+        """Last forecast hour available (end of the 16-day window), in UTC."""
+        today = self._now().astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        return today + timedelta(days=MAX_FORECAST_DAYS) - timedelta(hours=1)
 
     # -- internals ---------------------------------------------------------
     def _forecast_days(self, need_end: datetime) -> int:
