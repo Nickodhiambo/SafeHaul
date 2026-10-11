@@ -33,6 +33,7 @@ DEBUG = os.environ.get('SET_DEBUG', '1') == '1'
 ALLOWED_HOSTS = os.environ.get(
         'DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
+MAPBOX_TOKEN = os.environ.get('MAPBOX_TOKEN')
 
 # Application definition
 
@@ -67,6 +68,17 @@ MIDDLEWARE = [
 
 CORS_ALLOWED_ORIGINS = os.environ.get(
         'CORS_ALLOWED_ORIGINS', 'http://localhost:5173').split(',')
+
+WEATHER_WIND_METRIC = os.environ.get("WEATHER_WIND_METRIC", "sustained")  # or "gust"
+GEOCODE_COUNTRY = os.environ.get("GEOCODE_COUNTRY") or None  # e.g. "us,ca"
+
+REST_FRAMEWORK = {
+        "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+        "DEFAULT_AUTHENTICATION_CLASSES": [],
+        "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+        "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.AnonRateThrottle"],
+        "DEFAULT_THROTTLE_RATES": {"anon": "120/min"},
+}
 
 ROOT_URLCONF = 'config.urls'
 
