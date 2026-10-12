@@ -132,9 +132,13 @@ small {
   min-height: 0;
   background: #dfe6ec;
 }
-.map {
+/* Two-class selector on purpose: mapbox-gl's stylesheet sets `.mapboxgl-map { position: relative }`
+   and loads after this file (the map is lazy-loaded), which would collapse the container to 0 height. */
+.map-wrap > .map {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
 }
 
 /* phones: one pane at a time */

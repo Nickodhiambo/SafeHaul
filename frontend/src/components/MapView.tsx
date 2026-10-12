@@ -70,17 +70,25 @@ export default function MapView(props: Props) {
   useEffect(() => {
     if (!TOKEN || !containerRef.current) return;
     mapboxgl.accessToken = TOKEN;
-    const map = new mapboxgl.Map({
-      container: containerRef.current,
-      style: STYLE,
-      center: [-96, 38.5],
-      zoom: 3.4,
-      attributionControl: true,
-    });
+    let map: MapboxMap;
+    try {
+      map = new mapboxgl.Map({
+        container: containerRef.current,
+        style: STYLE,
+        center: [-96, 38.5],
+        zoom: 3.4,
+        attributionControl: true,
+      });
+    } catch {
+      setMapError("The map couldn't start. Your browser may not support WebGL, or it is turned off.");
+      return;
+    }
     mapRef.current = map;
     map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), "top-right");
 
+    let loaded = false;
     map.on("load", () => {
+      loaded = true;
       addMapLayers(map);
       wireInteractions(map);
       setReady(true);
@@ -88,6 +96,7 @@ export default function MapView(props: Props) {
     map.on("error", (e) => {
       const status = (e.error as { status?: number } | undefined)?.status;
       if (status === 401 || status === 403) setMapError("The map couldn't load: the Mapbox token was rejected.");
+      else if (!loaded) setMapError("The map couldn't load. Check your connection and that WebGL is enabled.");
     });
 
     const observer = new ResizeObserver(() => map.resize());
