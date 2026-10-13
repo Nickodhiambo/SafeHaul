@@ -6,7 +6,6 @@ SafeHaul helps a truck driver choose the safest of three routes. It forecasts th
 |---|---|
 | Live app | https://safe-haul-eight.vercel.app/ |
 | API | https://safehaul.onrender.com (health check: `/api/health/`) |
-| Walkthrough | https://www.loom.com/share/816e827f6129444bbfa342fae32789ca|
 
 > The API runs on free hosting and sleeps when idle. The first request after a quiet period can take up to a minute; the app shows a note when this happens.
 
